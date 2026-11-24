@@ -29965,7 +29965,14 @@ exports.run = run;
 const core = __importStar(__nccwpck_require__(7484));
 const exec = __importStar(__nccwpck_require__(5236));
 const github = __importStar(__nccwpck_require__(3228));
+const fs = __importStar(__nccwpck_require__(1943));
 const path = __importStar(__nccwpck_require__(6928));
+function getBool(name, defaultValue) {
+    if (core.getInput(name).trim() === '') {
+        return defaultValue;
+    }
+    return core.getBooleanInput(name);
+}
 async function run() {
     try {
         const repositoryPath = core.getInput('repository-path') || '.';
@@ -29976,16 +29983,19 @@ async function run() {
         const outputFile = core.getInput('output-file');
         const tagPrefix = core.getInput('tag-prefix') || 'v';
         const repositoryUrl = core.getInput('repository-url');
-        const includeAuthors = core.getBooleanInput('include-authors');
-        const includeCommitLinks = core.getBooleanInput('include-commit-links');
-        const includeIssueReferences = core.getBooleanInput('include-issue-references');
-        const includePrReferences = core.getBooleanInput('include-pr-references');
-        const groupBreakingChanges = core.getBooleanInput('group-breaking-changes');
+        const includeAuthors = getBool('include-authors', false);
+        const includeCommitLinks = getBool('include-commit-links', true);
+        const includeIssueReferences = getBool('include-issue-references', true);
+        const includePrReferences = getBool('include-pr-references', true);
+        const groupBreakingChanges = getBool('group-breaking-changes', true);
         const configFile = core.getInput('config-file');
-        const postToPr = core.getBooleanInput('post-to-pr');
-        const updateExistingComment = core.getBooleanInput('update-existing-comment');
+        const postToPr = getBool('post-to-pr', false);
+        const updateExistingComment = getBool('update-existing-comment', true);
         const commentHeader = core.getInput('comment-header') || '## 📝 Changelog';
         const token = core.getInput('token');
+        // The CLI resolves --output-file against its working directory; resolve it against the
+        // repository path instead so the file lands where the changelog-file output says it is.
+        const outputFilePath = outputFile ? path.resolve(repositoryPath, outputFile) : undefined;
         core.info('Generating changelog...');
         // Generate the changelog using mr-version CLI
         const result = await generateChangelog({
@@ -29994,7 +30004,7 @@ async function run() {
             fromVersion,
             toVersion,
             outputFormat,
-            outputFile,
+            outputFile: outputFilePath,
             tagPrefix,
             repositoryUrl,
             includeAuthors,
@@ -30008,9 +30018,9 @@ async function run() {
         core.setOutput('changelog-content', result.content);
         core.setOutput('version-range', result.versionRange);
         core.setOutput('has-breaking-changes', result.hasBreakingChanges.toString());
-        if (outputFile) {
-            const resolvedPath = path.resolve(repositoryPath, outputFile);
-            core.setOutput('changelog-file', resolvedPath);
+        if (outputFilePath) {
+            core.setOutput('changelog-file', outputFilePath);
+            core.info(`Changelog written to: ${outputFilePath}`);
         }
         // Post to PR if requested
         if (postToPr && github.context.eventName === 'pull_request') {
@@ -30028,7 +30038,7 @@ async function run() {
             .addDetails('📊 Metadata', `- **Version Range**: \`${result.versionRange}\`\n` +
             `- **Has Breaking Changes**: ${result.hasBreakingChanges ? '⚠️ Yes' : '✅ No'}\n` +
             `- **Output Format**: \`${outputFormat}\`\n` +
-            (outputFile ? `- **Output File**: \`${outputFile}\`\n` : '') +
+            (outputFilePath ? `- **Output File**: \`${outputFilePath}\`\n` : '') +
             `- **Repository**: \`${repositoryPath}\`\n` +
             `- **Tag Prefix**: \`${tagPrefix}\``)
             .write();
@@ -30059,29 +30069,35 @@ async function generateChangelog(options) {
         args.push('--to', options.toVersion);
     }
     if (options.outputFile) {
+        await fs.mkdir(path.dirname(options.outputFile), { recursive: true });
         args.push('--output-file', options.outputFile);
     }
     if (options.repositoryUrl) {
         args.push('--repo-url', options.repositoryUrl);
     }
+    // Boolean options: CLI default false -> pass the bare switch only when true;
+    // CLI default true -> pass "--x false" only when false. Older CLIs parsed every bool as a
+    // switch (so "--x false" could not turn a default-true option off and "--x false" on a
+    // default-false option turned it ON); newer CLIs accept an explicit true/false value.
     if (options.includeAuthors) {
         args.push('--include-authors');
     }
-    if (options.includeCommitLinks) {
-        args.push('--include-commits');
+    if (!options.includeCommitLinks) {
+        args.push('--include-commits', 'false');
     }
-    if (options.includeIssueReferences) {
-        args.push('--include-issues');
+    if (!options.includeIssueReferences) {
+        args.push('--include-issues', 'false');
     }
-    if (options.includePrReferences) {
-        args.push('--include-prs');
+    if (!options.includePrReferences) {
+        args.push('--include-prs', 'false');
     }
-    if (options.groupBreakingChanges) {
-        args.push('--group-breaking');
+    if (!options.groupBreakingChanges) {
+        args.push('--group-breaking', 'false');
     }
     if (options.configFile) {
         args.push('--config-file', options.configFile);
     }
+    core.debug(`Executing: mr-version ${args.join(' ')}`);
     const output = await exec.getExecOutput('mr-version', args, {
         silent: true,
         ignoreReturnCode: true
@@ -30089,10 +30105,24 @@ async function generateChangelog(options) {
     if (output.exitCode !== 0) {
         throw new Error(`mr-version changelog failed: ${output.stderr || output.stdout}`);
     }
-    const content = output.stdout.trim();
+    // With --output-file the CLI writes the changelog to the file and prints only a status line
+    // ("Changelog written to ..."), so read the content back from the file.
+    let content;
+    if (options.outputFile) {
+        try {
+            content = (await fs.readFile(options.outputFile, 'utf8')).trim();
+        }
+        catch (error) {
+            throw new Error(`mr-version changelog succeeded but the output file ${options.outputFile} could not be read: ` +
+                `${error instanceof Error ? error.message : String(error)}\nCLI output: ${output.stdout.trim()}`);
+        }
+    }
+    else {
+        content = output.stdout.trim();
+    }
     // Parse the output to extract metadata
     const versionRange = extractVersionRange(content, options.fromVersion, options.toVersion, options.tagPrefix);
-    const hasBreakingChanges = checkForBreakingChanges(content);
+    const hasBreakingChanges = checkForBreakingChanges(content, options.outputFormat);
     return {
         content,
         versionRange,
@@ -30117,11 +30147,24 @@ function extractVersionRange(content, from, to, tagPrefix) {
         return `...${ver}`;
     }
 }
-function checkForBreakingChanges(content) {
-    // Check for common breaking change indicators in the content
+function checkForBreakingChanges(content, outputFormat) {
+    if (outputFormat.toLowerCase() === 'json') {
+        try {
+            const changelog = JSON.parse(content);
+            const sections = changelog?.sections ?? [];
+            return sections.some(section => (section.entries ?? []).some(entry => entry.isBreakingChange === true));
+        }
+        catch {
+            return /"isBreakingChange"\s*:\s*true/.test(content);
+        }
+    }
+    // Markdown/text indicators: the grouped "Breaking Changes" section, and the per-entry
+    // breaking-change note that is printed when breaking changes are not grouped.
     const breakingChangePatterns = [
-        /###?\s*(?:💥|⚠️)?\s*breaking\s+changes?/i,
+        /^#*\s*(?:💥|⚠️)?\s*breaking\s+changes?\s*$/im,
         /BREAKING\s+CHANGE/i,
+        /\*\*BREAKING:\*\*/,
+        /^\s+WARNING: /m,
         /‼️/,
         /💥/
     ];
@@ -30247,6 +30290,14 @@ module.exports = require("events");
 
 "use strict";
 module.exports = require("fs");
+
+/***/ }),
+
+/***/ 1943:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("fs/promises");
 
 /***/ }),
 
