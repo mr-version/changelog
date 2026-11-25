@@ -85,5 +85,5 @@ outputs:
     description: 'Whether the changelog contains breaking changes'
 
 runs:
-  using: 'node20'
+  using: 'node24'
   main: 'dist/index.js'
